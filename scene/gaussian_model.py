@@ -20,7 +20,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
-
+os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 class GaussianModel:
 
     def setup_functions(self):
@@ -41,7 +41,7 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree : int):
+    def __init__(self, sh_degree : int, adc : str = "default"):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
@@ -58,6 +58,8 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
 
+        self.adc = adc
+
     def capture(self):
         return (
             self.active_sh_degree,
@@ -72,6 +74,7 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self.adc
         )
     
     def restore(self, model_args, training_args):
@@ -83,6 +86,7 @@ class GaussianModel:
         self._rotation, 
         self._opacity,
         self.max_radii2D, 
+        self.adc,
         xyz_gradient_accum, 
         denom,
         opt_dict, 
@@ -91,6 +95,7 @@ class GaussianModel:
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+
 
     @property
     def get_scaling(self):
@@ -387,8 +392,14 @@ class GaussianModel:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
-        grads = self.xyz_gradient_accum / self.denom
+        if self.adc == "ema":
+            grads = self.xyz_gradient_accum
+        else:
+            grads = self.xyz_gradient_accum / self.denom
+
         grads[grads.isnan()] = 0.0
+
+        print(self.adc, ",",self.xyz_gradient_accum.mean().item(),",",self.xyz_gradient_accum.size(dim=0))
 
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
@@ -403,5 +414,11 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
+        if self.adc == "ema":
+            self.xyz_gradient_accum[update_filter] = (
+                (1 - (2/(1+self.denom[update_filter]))) * self.xyz_gradient_accum[update_filter] + 
+                (2/(1+self.denom[update_filter])) * torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+            )
+        else:
+            self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
