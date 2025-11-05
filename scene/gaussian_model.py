@@ -417,7 +417,7 @@ class GaussianModel:
         if self.adc == "ema":
             self.xyz_gradient_accum[update_filter] = (
                 (1 - (2/(1+self.denom[update_filter]))) * self.xyz_gradient_accum[update_filter] + 
-                (2/(1+self.denom[update_filter])) * torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+                (2/(1+self.denom[update_filter])) * torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
             )
         else:
             self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
