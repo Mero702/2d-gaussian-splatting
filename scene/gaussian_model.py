@@ -53,6 +53,7 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
+        self.xyz_gradient_accum_square = torch.empty(0)
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -72,6 +73,7 @@ class GaussianModel:
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
+            self.xyz_gradient_accum_square,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
             self.adc
@@ -89,11 +91,13 @@ class GaussianModel:
         self.adc,
         xyz_gradient_accum, 
         denom,
-        opt_dict, 
+        opt_dict,
+        xyz_gradient_accum_square, 
         self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
+        self.xyz_gradient_accum_square = xyz_gradient_accum_square
         self.optimizer.load_state_dict(opt_dict)
 
 
@@ -154,6 +158,8 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+
+        self.xyz_gradient_accum_square = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -308,6 +314,8 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
+        self.xyz_gradient_accum_square = self.xyz_gradient_accum_square[valid_points_mask]
+
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -350,12 +358,20 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+        self.xyz_gradient_accum_square = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+
+    def densify_and_split(self, grads, grad_threshold, scene_extent, variance, variance_threshold, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
+
+        padded_variance = torch.zeros((n_init_points), device="cuda")
+        padded_variance[:variance.shape[0]] = variance.squeeze()
+
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                              padded_variance >= variance_threshold)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
@@ -376,9 +392,11 @@ class GaussianModel:
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, variance, variance_threshold):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                              variance.squeeze() >= variance_threshold)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         
@@ -391,18 +409,22 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, variance_threshold):
         if self.adc == "ema":
             grads = self.xyz_gradient_accum
+            grads_squared = self.xyz_gradient_accum_square
         else:
             grads = self.xyz_gradient_accum / self.denom
 
         grads[grads.isnan()] = 0.0
+        grads_squared[grads_squared.isnan()] = 0.0
 
         print(self.adc, ",",self.xyz_gradient_accum.mean().item(),",",self.xyz_gradient_accum.size(dim=0))
 
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        variance = torch.abs(grads_squared - (grads ** 2))
+
+        self.densify_and_clone(grads, max_grad, extent, variance, variance_threshold)
+        self.densify_and_split(grads, max_grad, extent, variance, variance_threshold)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
@@ -418,6 +440,10 @@ class GaussianModel:
             self.xyz_gradient_accum[update_filter] = (
                 (1 - (0.2/(1+self.denom[update_filter]))) * self.xyz_gradient_accum[update_filter] + 
                 (0.2/(1+self.denom[update_filter])) * torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
+            )
+            self.xyz_gradient_accum_square[update_filter] = (
+                (1 - (0.2/(1+self.denom[update_filter]))) * self.xyz_gradient_accum_square[update_filter] + 
+                (0.2/(1+self.denom[update_filter])) * (torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True) ** 2)
             )
         else:
             self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
