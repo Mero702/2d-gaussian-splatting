@@ -366,12 +366,12 @@ class GaussianModel:
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
 
-        padded_variance = torch.zeros((n_init_points), device="cuda")
-        padded_variance[:variance.shape[0]] = variance.squeeze()
-
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              padded_variance >= variance_threshold)
+        if self.adc == "var":
+            padded_variance = torch.zeros((n_init_points), device="cuda")
+            padded_variance[:variance.shape[0]] = variance.squeeze()
+            selected_pts_mask = torch.logical_and(selected_pts_mask, padded_variance >= variance_threshold)
+
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
@@ -395,8 +395,8 @@ class GaussianModel:
     def densify_and_clone(self, grads, grad_threshold, scene_extent, variance, variance_threshold):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              variance.squeeze() >= variance_threshold)
+        if self.adc == "var":
+            selected_pts_mask = torch.logical_and(selected_pts_mask, variance.squeeze() >= variance_threshold)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         
@@ -410,18 +410,21 @@ class GaussianModel:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, variance_threshold):
+        variance = None
         if self.adc == "ema":
             grads = self.xyz_gradient_accum
+        elif self.adc == "var":
+            grads = self.xyz_gradient_accum
             grads_squared = self.xyz_gradient_accum_square
+            grads_squared[grads_squared.isnan()] = 0.0
+            variance = torch.abs(grads_squared - (grads ** 2))
         else:
             grads = self.xyz_gradient_accum / self.denom
 
         grads[grads.isnan()] = 0.0
-        grads_squared[grads_squared.isnan()] = 0.0
+        
 
         print(self.adc, ",",self.xyz_gradient_accum.mean().item(),",",self.xyz_gradient_accum.size(dim=0))
-
-        variance = torch.abs(grads_squared - (grads ** 2))
 
         self.densify_and_clone(grads, max_grad, extent, variance, variance_threshold)
         self.densify_and_split(grads, max_grad, extent, variance, variance_threshold)
@@ -436,15 +439,18 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        if self.adc == "ema":
+        if self.adc == "ema" or self.adc == "var":
             self.xyz_gradient_accum[update_filter] = (
                 (1 - (0.2/(1+self.denom[update_filter]))) * self.xyz_gradient_accum[update_filter] + 
                 (0.2/(1+self.denom[update_filter])) * torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
             )
+        else:
+            self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
+
+        if self.adc == "var":
             self.xyz_gradient_accum_square[update_filter] = (
                 (1 - (0.2/(1+self.denom[update_filter]))) * self.xyz_gradient_accum_square[update_filter] + 
                 (0.2/(1+self.denom[update_filter])) * (torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True) ** 2)
             )
-        else:
-            self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
+
         self.denom[update_filter] += 1
